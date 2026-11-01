@@ -1,41 +1,59 @@
 # 納期遅れ・停滞の早期検知デモ
 
-町工場向けの営業デモです。工程表CSVを読み、遅れ・着手遅れ・停滞・納期リスク・保留をルールで拾い、今週手を打つ案件を文章にします。
+町工場向けの営業デモ用アプリです。工程進捗のCSVを読み込み、ルールで「遅れ・停滞」を自動抽出し、重要度順の一覧と「今週手を打つべき案件と理由」のレポートを表示します。
+※同梱のサンプルデータはすべて **架空** の会社・案件です。
 
-データはすべて架空です（`sample_orders.csv`）。APIキーはリポジトリに含まれません。
-
-## 起動
-
+## 起動方法
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+cd /workspace/delay-demo
+python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py
+python generate_sample.py          # サンプルCSVを再生成（固定シード、任意）
+streamlit run app.py --server.headless true --server.port 8501
 ```
+ブラウザで http://localhost:8501 を開きます。
 
-ブラウザで開くと、基準日 2026-11-10 のサンプル（28受注・123工程）が表示されます。未アップロードのときは `app.py` と同じディレクトリの `sample_orders.csv` を使います。
+### AIレポート（任意）
+環境変数 `XAI_API_KEY`（優先）または `OPENAI_API_KEY` を設定すると、「AIでレポートを生成」ボタンでAIが文章を作成します。モデルは `LLM_MODEL` で変更可（既定：grok-4 / gpt-4o-mini）。
+未設定・エラー時はルールベースのレポート（「ルールベース生成」表示）になります。
 
-```bash
-python test_logic.py
-python test_app.py
-```
+## 画面構成
+- サイドバー：CSVアップロード（未指定時はサンプル）、基準日（既定 2026-11-10）、しきい値
+- KPI：全案件数／要注意案件数／高リスク件数／停滞工程数
+- 要注意案件一覧：重要度順・色分け・理由付き、CSVダウンロード
+- 案件ドリルダウン：工程一覧と予定vs実績のガントチャート
+- AIレポート：今週対応すべき案件トップ5、理由、推奨アクション
 
-サンプルを作り直す場合:
+## CSV仕様（1行 = 1受注の1工程、UTF-8 / Shift_JIS 対応）
+| 列名 | 内容 | 例 |
+|---|---|---|
+| order_id | 受注番号 | ORD-1001 |
+| customer | 顧客名 | 株式会社テスト精工 |
+| product | 品名 | ブラケット |
+| qty | 数量 | 100 |
+| due_date | 納期 | 2026-11-20 |
+| process_seq | 工程順 | 1 |
+| process_name | 工程名 | 切断／曲げ／溶接／機械加工／表面処理／検査／出荷 |
+| planned_start / planned_end | 予定開始日／予定完了日 | 2026-11-05 |
+| actual_start / actual_end | 実績開始日／実績完了日（未実績は空欄） | |
+| status | 未着手／着手中／完了／保留 | 着手中 |
+| last_updated | 最終更新日 | 2026-11-09 |
+| note | メモ | 外注待ち（メッキ） |
 
-```bash
-python generate_sample.py
-```
+## 検知ルール（基準日 = today）
+| ルール | 条件 |
+|---|---|
+| 遅延 | today > 予定完了日 かつ 未完了 |
+| 着手遅れ | today > 予定開始日 かつ 状態が未着手 |
+| 停滞 | 着手中 かつ (today − 最終更新日) ≥ N日（既定3） |
+| 納期リスク | 未完了工程の予定日数（予定完了−予定開始+1）の合計 ＞ 納期までの日数 |
+| 保留 | 状態が保留、または未完了工程のメモに「待ち」「不足」「確認中」を含む |
 
-## 画面
+### 重要度スコア（受注単位）
+遅延 30＋超過日数×3（上限+30）、着手遅れ 15＋日数×2（上限+15）、停滞 25＋超過日数×3（上限+20）、納期リスク 25＋不足日数×3（上限+30）、保留 25、
+納期まで7日以内（変更可）で問題あり +40、納期超過 +30。
+**納期7日以内かつ問題あり → 「高」**、スコア80以上 → 「高」、25以上 → 「中」、それ以外 → 「低」。
 
-- **要注意案件一覧** — 重要度・スコア順。問題のない案件は初期状態では隠し、CSVで書き出せます。
-- **案件ドリルダウン** — 該当理由、予定と実績のガント、工程表。
-- **AIレポート** — キーが無いときはルールベースの文章です。`XAI_API_KEY`（優先）または `OPENAI_API_KEY` があると「AIでレポートを作成」が出ます。モデルは `LLM_MODEL` で上書きできます。
-
-Streamlit Community Cloud では、これらのキーをアプリの Secrets に置いてください。`.streamlit/secrets.toml` は git に含めません。
-
-## 自社CSV
-
-1行が1工程です。必須列は `order_id`, `customer`, `product`, `qty`, `due_date`, `process_seq`, `process_name`, `planned_start`, `planned_end`, `actual_start`, `actual_end`, `status`, `last_updated`, `note` です。文字コードは UTF-8（BOM可）または Shift_JIS。`status` は `未着手` / `着手中` / `完了` / `保留`。
-
-検知ルールとスコアの詳細は `DESIGN.md` を参照してください。
+## ファイル
+- `app.py` 画面（Streamlit） / `logic.py` 検知ロジック / `generate_sample.py` サンプル生成
+- `test_logic.py`, `test_app.py` 動作確認用テスト

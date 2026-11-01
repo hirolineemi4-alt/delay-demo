@@ -1,542 +1,247 @@
-"""納期遅れ・停滞の検知、スコアリング、レポート生成。
-
-Streamlit に依存しない。基準日・しきい値は呼び出し側から渡す。
-"""
-
+"""納期遅れ・停滞の検知ロジック（Streamlitに依存しない純粋関数）。"""
 from __future__ import annotations
-
 import io
 import json
 import os
-from datetime import date, datetime
-from pathlib import Path
-
+from dataclasses import dataclass
 import pandas as pd
-import requests
 
-REQUIRED_COLUMNS = [
-    "order_id",
-    "customer",
-    "product",
-    "qty",
-    "due_date",
-    "process_seq",
-    "process_name",
-    "planned_start",
-    "planned_end",
-    "actual_start",
-    "actual_end",
-    "status",
-    "last_updated",
-    "note",
-]
-
-DATE_COLUMNS = [
-    "due_date",
-    "planned_start",
-    "planned_end",
-    "actual_start",
-    "actual_end",
-    "last_updated",
-]
-
-HOLD_KEYWORDS = ("待ち", "不足", "確認中")
-DEFAULT_TODAY = date(2026, 11, 10)
-LEVEL_RANK = {"高": 0, "中": 1, "低": 2}
-
-SYSTEM_PROMPT = (
-    "あなたは製造業の生産管理コンサルタントです。"
-    "簡潔で実務的な日本語で答えてください。"
-    "データにない事実は創作しないでください。"
-)
+REQUIRED_COLUMNS = ["order_id", "customer", "product", "qty", "due_date", "process_seq", "process_name",
+                    "planned_start", "planned_end", "actual_start", "actual_end", "status", "last_updated", "note"]
+DATE_COLUMNS = ["due_date", "planned_start", "planned_end", "actual_start", "actual_end", "last_updated"]
+HOLD_KEYWORDS = ["待ち", "不足", "確認中"]
+FLAG_ORDER = ["遅延", "着手遅れ", "停滞", "納期リスク", "保留"]
 
 
-def read_orders(source) -> pd.DataFrame:
-    """CSV（パス、bytes、ファイルオブジェクト）を読み、日付を変換する。
+@dataclass
+class Thresholds:
+    stall_days: int = 3          # 停滞とみなす未更新日数
+    due_window: int = 7          # 「納期が近い」とみなす日数
+    high_score: int = 80         # これ以上は「高」
+    mid_score: int = 25          # これ以上は「中」
 
-    UTF-8（BOM 可）で失敗したら Shift_JIS（cp932）を試す。
-    """
-    raw = _read_bytes(source)
-    last_error: Exception | None = None
-    text = None
-    for encoding in ("utf-8-sig", "cp932"):
+
+def read_csv(src) -> pd.DataFrame:
+    """CSVを読み込む（UTF-8 / UTF-8 BOM / Shift_JIS(cp932) に対応）。"""
+    raw = src.read() if hasattr(src, "read") else open(src, "rb").read()
+    for enc in ("utf-8-sig", "cp932"):
         try:
-            text = raw.decode(encoding)
+            df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str, keep_default_na=False)
             break
-        except UnicodeDecodeError as exc:
-            last_error = exc
-    if text is None:
-        raise ValueError(f"CSVの文字コードを判定できませんでした: {last_error}")
-
-    frame = pd.read_csv(io.StringIO(text))
-    frame.columns = [str(col).strip() for col in frame.columns]
-    missing = [col for col in REQUIRED_COLUMNS if col not in frame.columns]
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ValueError("文字コードを判別できませんでした（UTF-8 または Shift_JIS で保存してください）")
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError("必須列がありません: " + ", ".join(missing))
-
-    frame = frame[REQUIRED_COLUMNS].copy()
-    frame["order_id"] = frame["order_id"].astype(str).str.strip()
-    frame["customer"] = frame["customer"].fillna("").astype(str).str.strip()
-    frame["product"] = frame["product"].fillna("").astype(str).str.strip()
-    frame["process_name"] = frame["process_name"].fillna("").astype(str).str.strip()
-    frame["status"] = frame["status"].fillna("").astype(str).str.strip()
-    frame["note"] = frame["note"].fillna("").astype(str).str.strip()
-    frame["qty"] = pd.to_numeric(frame["qty"], errors="coerce").fillna(0).astype(int)
-    frame["process_seq"] = pd.to_numeric(frame["process_seq"], errors="coerce")
-    for column in DATE_COLUMNS:
-        frame[column] = pd.to_datetime(frame[column], errors="coerce")
-    frame = frame.sort_values(["order_id", "process_seq"], kind="mergesort").reset_index(drop=True)
-    return frame
+        raise ValueError(f"必須列が不足しています: {', '.join(missing)}")
+    df = df[REQUIRED_COLUMNS].copy()
+    for c in DATE_COLUMNS:
+        df[c] = pd.to_datetime(df[c].str.strip().replace("", None), errors="coerce")
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    df["process_seq"] = pd.to_numeric(df["process_seq"], errors="coerce")
+    for c in ["status", "note", "process_name", "order_id", "customer", "product"]:
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    return df.sort_values(["order_id", "process_seq"]).reset_index(drop=True)
 
 
-def detect_processes(frame: pd.DataFrame, today: date, stall_days: int) -> pd.DataFrame:
-    """工程行に遅延・着手遅れ・停滞・保留のフラグと理由を付ける。"""
-    rows: list[dict] = []
-    for record in frame.to_dict(orient="records"):
-        status = record["status"]
-        incomplete = status != "完了"
-        planned_start = _as_date(record["planned_start"])
-        planned_end = _as_date(record["planned_end"])
-        last_updated = _as_date(record["last_updated"])
-        note = record["note"] or ""
-
-        delay_days = 0
-        is_delayed = False
-        if incomplete and planned_end is not None and today > planned_end:
-            is_delayed = True
-            delay_days = (today - planned_end).days
-
-        start_delay_days = 0
-        is_start_delayed = False
-        if status == "未着手" and planned_start is not None and today > planned_start:
-            is_start_delayed = True
-            start_delay_days = (today - planned_start).days
-
-        stale_days = 0
-        is_stalled = False
-        if status == "着手中" and last_updated is not None:
-            stale_days = (today - last_updated).days
-            is_stalled = stale_days >= stall_days
-
-        is_on_hold = status == "保留" or (incomplete and _contains_any(note, HOLD_KEYWORDS))
-        duration_days = 0
-        if planned_start is not None and planned_end is not None:
-            duration_days = max(0, (planned_end - planned_start).days + 1)
-
-        parts: list[str] = []
-        name = record["process_name"]
-        if is_delayed and planned_end is not None:
-            parts.append(f"遅延：{name}（予定完了{_md(planned_end)}、{delay_days}日超過）")
-        if is_stalled:
-            parts.append(f"停滞：{name}（{stale_days}日間更新なし）")
-        if is_start_delayed and planned_start is not None:
-            parts.append(f"着手遅れ：{name}（予定開始{_md(planned_start)}、未着手）")
-        if is_on_hold:
-            parts.append(f"保留：{name}（{note}）" if note else f"保留：{name}")
-
-        enriched = dict(record)
-        enriched.update(
-            {
-                "is_incomplete": incomplete,
-                "is_delayed": is_delayed,
-                "delay_days": delay_days,
-                "is_start_delayed": is_start_delayed,
-                "start_delay_days": start_delay_days,
-                "is_stalled": is_stalled,
-                "stale_days": stale_days,
-                "is_on_hold": is_on_hold,
-                "duration_days": duration_days,
-                "reason_parts": parts,
-            }
-        )
-        rows.append(enriched)
-    return pd.DataFrame(rows)
+def _fmt(dt) -> str:
+    return "-" if pd.isna(dt) else f"{dt.month}/{dt.day}"
 
 
-def summarize_orders(
-    processes: pd.DataFrame,
-    today: date,
-    stall_days: int,
-    urgent_days: int,
-    high_score: int,
-    mid_score: int,
-) -> pd.DataFrame:
-    """工程フラグを受注単位に集約し、納期リスク・スコア・重要度を付ける。"""
-    summaries: list[dict] = []
-    if processes.empty:
-        return pd.DataFrame(summaries)
+def detect_processes(df: pd.DataFrame, today, th: Thresholds) -> pd.DataFrame:
+    """工程単位でフラグを付与する。"""
+    today = pd.Timestamp(today).normalize()
+    p = df.copy()
+    not_done = p["status"] != "完了"
+    p["days_late"] = (today - p["planned_end"]).dt.days.where(not_done)
+    p["days_since_update"] = (today - p["last_updated"]).dt.days
+    p["f_遅延"] = not_done & (today > p["planned_end"])
+    p["f_着手遅れ"] = (p["status"] == "未着手") & (today > p["planned_start"])
+    p["f_停滞"] = (p["status"] == "着手中") & (p["days_since_update"] >= th.stall_days)
+    note_hit = p["note"].apply(lambda s: any(k in s for k in HOLD_KEYWORDS))
+    p["f_保留"] = (p["status"] == "保留") | (not_done & note_hit)
+    p["planned_days"] = (p["planned_end"] - p["planned_start"]).dt.days + 1
 
-    ordered = processes.sort_values(["order_id", "process_seq"], kind="mergesort")
-    for order_id, group in ordered.groupby("order_id", sort=False):
-        first = group.iloc[0]
-        due = _as_date(first["due_date"])
-        incomplete = group[group["is_incomplete"]]
-        remaining = int(incomplete["duration_days"].sum()) if len(incomplete) else 0
-        if due is None:
-            days_until = 10**6
-            due_risk = False
-            shortage = 0
-        else:
-            days_until = (due - today).days
-            due_risk = remaining > days_until
-            shortage = remaining - days_until if due_risk else 0
+    reasons = []
+    for _, r in p.iterrows():
+        rs = []
+        if r["f_遅延"]:
+            rs.append(f"遅延：{r.process_name}（予定完了{_fmt(r.planned_end)}、{int(r.days_late)}日超過）")
+        if r["f_着手遅れ"]:
+            rs.append(f"着手遅れ：{r.process_name}（予定開始{_fmt(r.planned_start)}、未着手）")
+        if r["f_停滞"]:
+            rs.append(f"停滞：{r.process_name}（{int(r.days_since_update)}日間更新なし）")
+        if r["f_保留"]:
+            rs.append(f"保留：{r.process_name}（{r.note or '状態=保留'}）")
+        reasons.append(rs)
+    p["reasons"] = reasons
+    return p
 
-        delayed = bool(group["is_delayed"].any())
-        start_delayed = bool(group["is_start_delayed"].any())
-        stalled = bool(group["is_stalled"].any())
-        on_hold = bool(group["is_on_hold"].any())
-        any_flag = delayed or start_delayed or stalled or due_risk or on_hold
 
-        max_delay = int(group.loc[group["is_delayed"], "delay_days"].max()) if delayed else 0
-        max_start = (
-            int(group.loc[group["is_start_delayed"], "start_delay_days"].max())
-            if start_delayed
-            else 0
-        )
-        max_stale = int(group.loc[group["is_stalled"], "stale_days"].max()) if stalled else 0
+def summarize_orders(p: pd.DataFrame, today, th: Thresholds) -> pd.DataFrame:
+    """受注単位で集約し、スコアと重要度（高/中/低）を算出する。"""
+    today = pd.Timestamp(today).normalize()
+    out = []
+    for oid, g in p.groupby("order_id", sort=False):
+        g = g.sort_values("process_seq")
+        first = g.iloc[0]
+        due = first["due_date"]
+        days_to_due = int((due - today).days) if pd.notna(due) else None
+        all_done = (g["status"] == "完了").all()
+        remaining = g.loc[g["status"] != "完了", "planned_days"].sum()
+        risk = (not all_done) and days_to_due is not None and remaining > days_to_due
+        shortage = int(remaining - days_to_due) if risk else 0
 
+        flags = {f: bool(g[f"f_{f}"].any()) for f in ["遅延", "着手遅れ", "停滞", "保留"]}
+        flags["納期リスク"] = bool(risk)
+        reasons = [x for lst in g["reasons"] for x in lst]
+        if risk:
+            reasons.append(f"納期リスク：残工程の予定日数{int(remaining)}日 ＞ 納期まで{days_to_due}日（{shortage}日不足）")
+
+        # --- スコア ---
         score = 0
-        if delayed:
-            score += 30 + min(30, 3 * max_delay)
-        if start_delayed:
-            score += 15 + min(15, 2 * max_start)
-        if stalled:
-            score += 25 + min(20, 3 * (max_stale - stall_days))
-        if due_risk:
+        if flags["遅延"]:
+            score += 30 + min(30, 3 * int(g["days_late"].where(g["f_遅延"]).max()))
+        if flags["着手遅れ"]:
+            late_start = (today - g.loc[g["f_着手遅れ"], "planned_start"]).dt.days.max()
+            score += 15 + min(15, 2 * int(late_start))
+        if flags["停滞"]:
+            stale = int(g.loc[g["f_停滞"], "days_since_update"].max())
+            score += 25 + min(20, 3 * (stale - th.stall_days))
+        if flags["納期リスク"]:
             score += 25 + min(30, 3 * shortage)
-        if on_hold:
+        if flags["保留"]:
             score += 25
-
-        urgent = bool(any_flag and 0 <= days_until <= urgent_days)
-        past_due = bool(any_flag and days_until < 0)
+        any_flag = any(flags.values())
+        urgent = any_flag and days_to_due is not None and days_to_due <= th.due_window
         if urgent:
             score += 40
-        if past_due:
-            score += 30
+        if any_flag and days_to_due is not None and days_to_due < 0:
+            score += 30  # 納期超過
 
-        if urgent or score >= high_score:
-            importance = "高"
-        elif score >= mid_score:
-            importance = "中"
+        if urgent or score >= th.high_score:
+            rank = "高"
+        elif score >= th.mid_score:
+            rank = "中"
         else:
-            importance = "低"
+            rank = "低"
 
-        labels = []
-        if delayed:
-            labels.append("遅延")
-        if start_delayed:
-            labels.append("着手遅れ")
-        if stalled:
-            labels.append("停滞")
-        if due_risk:
-            labels.append("納期リスク")
-        if on_hold:
-            labels.append("保留")
-
-        reasons: list[str] = []
-        for parts in group["reason_parts"]:
-            reasons.extend(parts)
-        if due_risk:
-            if days_until >= 0:
-                reasons.append(
-                    f"納期リスク：残工程の予定日数{remaining}日 > 納期まで{days_until}日（{shortage}日不足）"
-                )
-            else:
-                reasons.append(
-                    f"納期リスク：残工程の予定日数{remaining}日 > 納期を{-days_until}日超過（{shortage}日不足）"
-                )
-
-        if len(incomplete):
-            current = incomplete.iloc[0]
-            current_process = f"{current['process_name']}（{current['status']}）"
-            open_notes = " ".join(note for note in incomplete["note"].tolist() if note)
-        else:
-            current_process = "完了"
-            open_notes = ""
-
-        n_total = int(len(group))
-        n_done = int((~group["is_incomplete"]).sum())
-        summaries.append(
-            {
-                "order_id": order_id,
-                "customer": first["customer"],
-                "product": first["product"],
-                "qty": int(first["qty"]),
-                "due_date": due,
-                "days_until": int(days_until),
-                "n_total": n_total,
-                "n_done": n_done,
-                "progress": f"{n_done}/{n_total}",
-                "current_process": current_process,
-                "remaining_days": remaining,
-                "shortage_days": int(shortage),
-                "delayed": delayed,
-                "start_delayed": start_delayed,
-                "stalled": stalled,
-                "due_risk": due_risk,
-                "on_hold": on_hold,
-                "any_flag": any_flag,
-                "n_stalled_processes": int(group["is_stalled"].sum()),
-                "score": int(score),
-                "importance": importance,
-                "urgent": urgent,
-                "past_due": past_due,
-                "rules_label": "・".join(labels) if labels else "問題なし",
-                "reasons": reasons,
-                "open_notes": open_notes,
-            }
-        )
-
-    result = pd.DataFrame(summaries)
-    result["_rank"] = result["importance"].map(LEVEL_RANK)
-    result = result.sort_values(
-        ["_rank", "score", "days_until", "order_id"],
-        ascending=[True, False, True, True],
-        kind="mergesort",
-    ).drop(columns="_rank")
-    return result.reset_index(drop=True)
+        cur = g[g["status"] != "完了"]
+        current = "全工程完了" if cur.empty else f"{cur.iloc[0].process_name}（{cur.iloc[0].status}）"
+        notes = "／".join(n for n in g["note"] if n and any(k in n for k in HOLD_KEYWORDS))
+        out.append(dict(
+            order_id=oid, customer=first["customer"], product=first["product"], qty=first["qty"],
+            due_date=due, days_to_due=days_to_due, current_process=current,
+            progress=f"{int((g['status'] == '完了').sum())}/{len(g)}",
+            remaining_days=int(remaining), score=int(score), rank=rank,
+            issues="・".join(f for f in FLAG_ORDER if flags[f]) or "問題なし",
+            reasons=" ／ ".join(reasons), hold_notes=notes, **{f"f_{k}": v for k, v in flags.items()},
+        ))
+    o = pd.DataFrame(out)
+    rank_order = {"高": 0, "中": 1, "低": 2}
+    o["_r"] = o["rank"].map(rank_order)
+    o = o.sort_values(["_r", "score", "days_to_due"], ascending=[True, False, True]).drop(columns="_r")
+    return o.reset_index(drop=True)
 
 
-def analyze(
-    frame: pd.DataFrame,
-    today: date,
-    stall_days: int = 3,
-    urgent_days: int = 7,
-    high_score: int = 80,
-    mid_score: int = 25,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    processes = detect_processes(frame, today, stall_days)
-    orders = summarize_orders(processes, today, stall_days, urgent_days, high_score, mid_score)
-    return processes, orders
+def analyze(df: pd.DataFrame, today, th: Thresholds):
+    p = detect_processes(df, today, th)
+    o = summarize_orders(p, today, th)
+    return p, o
 
 
-def rule_based_report(
-    orders: pd.DataFrame,
-    today: date,
-    urgent_days: int,
-    n_process_rows: int | None = None,
-) -> str:
-    """テンプレートで「今週手を打つべき案件」レポートを作る。"""
-    if orders.empty:
-        return f"# 今週手を打つべき案件レポート（基準日：{_jp_date(today)}）\n\n案件がありません。"
-
-    attention = orders[orders["any_flag"]]
-    n_orders = len(orders)
-    n_attention = int(len(attention))
-    n_high = int((orders["importance"] == "高").sum())
-    counts = {
-        "遅延": int(orders["delayed"].sum()),
-        "着手遅れ": int(orders["start_delayed"].sum()),
-        "停滞": int(orders["stalled"].sum()),
-        "納期リスク": int(orders["due_risk"].sum()),
-        "保留": int(orders["on_hold"].sum()),
-    }
-    notes = " ".join(attention["open_notes"].tolist())
-    external = _contains_any(notes, ("外注", "材料", "図面", "待ち", "確認中"))
-
-    lines = [
-        f"# 今週手を打つべき案件レポート（基準日：{_jp_date(today)}）",
-        "",
-        "## 全体所見",
-        f"- 全{n_orders}案件のうち、要注意案件は{n_attention}件、うち高リスクは{n_high}件です。",
-        (
-            "- 内訳：遅延{遅延}件、着手遅れ{着手遅れ}件、停滞{停滞}件、"
-            "納期リスク{納期リスク}件、保留{保留}件（重複あり）"
-        ).format(**counts),
-    ]
-    if n_process_rows is not None:
-        lines.append(f"- 工程行数は{n_process_rows}行です。")
-    if external:
-        lines.append(
-            "- 材料・外注・図面確認など社外要因による停止が含まれます。"
-            "社内努力だけでは解消しないため、先方への確認を最優先にしてください。"
-        )
-    elif n_attention:
-        lines.append("- 社外要因による停止は見当たりません。社内工程の遅れと停滞を優先して確認してください。")
-    else:
-        lines.append("- この基準日では、検知ルールに該当する案件はありません。")
-
-    lines.extend(["", "## 今週対応すべき案件トップ5"])
-    top = attention.head(5)
-    if top.empty:
-        lines.append("- 今週すぐに手を打つべき案件はありません。")
-    for index, row in enumerate(top.itertuples(index=False), start=1):
-        due_value = _as_date(row.due_date)
-        due = _md(due_value) if due_value is not None else "未設定"
-        if row.days_until >= 0:
-            remain = f"残{row.days_until}日"
-        else:
-            remain = f"{-row.days_until}日超過"
-        lines.append(
-            f"{index}. {row.order_id} | {row.customer} | {row.product} {row.qty}個"
-            f" — 重要度 {row.importance}（スコア{row.score}）"
-        )
-        lines.append(f"   - 納期：{due}（{remain}）　現在工程：{row.current_process}")
-        lines.append("   - 理由：")
-        for reason in row.reasons:
-            lines.append(f"     - {reason}")
-        actions = recommended_actions(row, urgent_days)
-        lines.append(f"   - 推奨アクション：{'、'.join(actions)}")
-
-    lines.extend(
-        [
-            "",
-            "## 今週の進め方",
-            "1. 重要度「高」の案件から、担当と本日の打ち手を決める。",
-            "2. 外注・材料・図面など社外待ちは、先方へ本日中に状況を確認する。",
-            "3. 停滞している工程は、止まっている理由を確認し進捗を更新する。",
-            "4. 納期が近い案件は、遅れそうな時点で顧客へ事前連絡する。",
-        ]
-    )
-    return "\n".join(lines) + "\n"
-
-
-def recommended_actions(row, urgent_days: int) -> list[str]:
-    notes = row.open_notes or ""
-    actions: list[str] = []
+# ---------------- レポート ----------------
+def recommend_actions(row: pd.Series, th: Thresholds) -> list[str]:
+    acts = []
+    notes = row.get("hold_notes", "") or ""
     if "外注" in notes:
-        actions.append("外注先に戻り日を確認する")
+        acts.append("外注先へ戻り日を電話で確認し、確定日を回答してもらう")
     if "材料" in notes:
-        actions.append("材料の入荷日を確認し、着手日を組み直す")
+        acts.append("仕入先へ入荷日を再確認。間に合わない場合は代替材・在庫材の流用を検討")
     if "図面" in notes or "確認中" in notes:
-        actions.append("図面確認の回答を先方に督促する")
-    if "人員" in notes or ("不足" in notes and "材料" not in notes):
-        actions.append("人員を手配するか、工程を振り替える")
-    if row.stalled:
-        actions.append("停滞工程の現状を確認し、最終更新を実態に合わせる")
-    if row.delayed or row.start_delayed:
-        actions.append("遅れている工程を前倒しできるか検討する")
-    if row.due_risk:
-        actions.append("残工程の予定を見直し、納期に収まるよう組み替える")
-    if 0 <= row.days_until <= urgent_days:
-        actions.append("顧客へ納期遅延の可能性を事前連絡する")
-    if not actions:
-        actions.append("進捗を確認し、必要なら計画を更新する")
-    return actions
+        acts.append("顧客へ回答期限を区切って図面確認を依頼（回答待ちで工程が止まっている旨を共有）")
+    if "人員" in notes or "不足" in notes:
+        acts.append("他班からの応援・残業／休日出勤で人員を補填")
+    if row["f_停滞"]:
+        acts.append("担当者に現状をヒアリングし、止まっている原因（設備・治具・段取り）を当日中に特定")
+    if row["f_遅延"] or row["f_着手遅れ"]:
+        acts.append("後工程の段取りを前倒しし、設備の空き枠に割り込みを検討")
+    if row["f_納期リスク"]:
+        acts.append("工程の並行化・外注活用で短縮できるか検討")
+        if row["days_to_due"] is not None and row["days_to_due"] <= th.due_window:
+            acts.append("顧客へ事前連絡し、分納や納期調整の可能性を早めに相談")
+    if not acts:
+        acts.append("進捗を日次で確認")
+    return list(dict.fromkeys(acts))
 
 
-def build_llm_prompt(orders: pd.DataFrame, today: date) -> str:
-    attention = orders[orders["any_flag"]].head(8)
-    payload = []
-    for row in attention.itertuples(index=False):
-        payload.append(
-            {
-                "order_id": row.order_id,
-                "customer": row.customer,
-                "product": row.product,
-                "qty": int(row.qty),
-                "due_date": _as_date(row.due_date).isoformat() if _as_date(row.due_date) else None,
-                "days_until": int(row.days_until),
-                "importance": row.importance,
-                "score": int(row.score),
-                "current_process": row.current_process,
-                "flags": row.rules_label,
-                "reasons": list(row.reasons),
-            }
-        )
-    body = json.dumps(payload, ensure_ascii=False, indent=2)
-    return (
-        f"基準日: {today.isoformat()}\n"
-        f"全案件数: {len(orders)}\n"
-        f"要注意案件（上位{len(payload)}件）:\n{body}\n\n"
-        "次の構成でレポートを書いてください。\n"
-        "①全体所見（3行以内）\n"
-        "②今週対応すべきトップ5（各案件の理由と推奨アクション。"
-        "外注先確認、工程の前倒し、顧客への事前連絡など、データから言える範囲で）\n"
-        "③今週の進め方\n"
-        "データにない事実は創作しないでください。\n"
-    )
+def rule_based_report(o: pd.DataFrame, today, th: Thresholds, top_n: int = 5) -> str:
+    today = pd.Timestamp(today)
+    flagged = o[o["issues"] != "問題なし"]
+    top = flagged.head(top_n)
+    n_high = int((o["rank"] == "高").sum())
+    lines = [f"## 今週手を打つべき案件レポート（基準日：{today:%Y年%m月%d日}）", "",
+             "### 全体所見",
+             f"- 全{len(o)}案件のうち、要注意案件は **{len(flagged)}件**、うち高リスクは **{n_high}件** です。"]
+    cnt = {f: int(o[f"f_{f}"].sum()) for f in FLAG_ORDER}
+    lines.append("- 内訳：" + "、".join(f"{k} {v}件" for k, v in cnt.items()) + "（重複あり）")
+    if cnt["保留"]:
+        lines.append("- 材料・外注・図面確認など**社外要因による停止**が含まれます。社内努力だけでは解消しないため、先方への確認を最優先にしてください。")
+    lines += ["", f"### 今週対応すべき案件トップ{len(top)}", ""]
+    for i, (_, r) in enumerate(top.iterrows(), 1):
+        due_txt = f"{r.due_date:%m/%d}（残り{r.days_to_due}日）" if r.days_to_due >= 0 else f"{r.due_date:%m/%d}（{-r.days_to_due}日超過）"
+        lines.append(f"**{i}. {r.order_id}｜{r.customer}｜{r["product"]} {int(r.qty)}個** — 重要度 **{r['rank']}**（スコア{r.score}）")
+        lines.append(f"- 納期：{due_txt}　現在工程：{r.current_process}")
+        lines.append("- 理由：")
+        for rs in r.reasons.split(" ／ "):
+            lines.append(f"  - {rs}")
+        lines.append("- 推奨アクション：")
+        for a in recommend_actions(r, th):
+            lines.append(f"  - {a}")
+        lines.append("")
+    lines += ["### 今週の進め方（提案）",
+              "1. 朝会で上記案件の担当者・期限を決める",
+              "2. 社外要因（外注・材料・図面）は当日中に先方へ連絡し、回答期限を設定",
+              "3. 納期が7日以内の案件は、遅れが見込まれる時点で顧客へ事前連絡（信頼維持）",
+              "4. 進捗の更新（last_updated）を毎日入力し、停滞の見逃しを防ぐ", "",
+              "_※本レポートはルールベースで自動生成しています（AI APIキー未設定時）。_"]
+    return "\n".join(lines)
 
 
-def llm_report(user_prompt: str, api_key: str, url: str, model: str) -> str:
-    """xAI または OpenAI 互換の chat completions を1回呼ぶ。"""
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "temperature": 0.3,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
-        timeout=90,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return payload["choices"][0]["message"]["content"]
+def build_llm_prompt(o: pd.DataFrame, today, top_n: int = 8) -> str:
+    flagged = o[o["issues"] != "問題なし"].head(top_n)
+    items = [dict(案件=r.order_id, 顧客=r.customer, 品名=r["product"], 数量=int(r.qty),
+                  納期=f"{r.due_date:%Y-%m-%d}", 納期まで日数=r.days_to_due, 重要度=r["rank"],
+                  スコア=r.score, 現在工程=r.current_process, フラグ=r.issues, 理由=r.reasons)
+             for _, r in flagged.iterrows()]
+    return (f"あなたは日本の中小製造業（町工場）の生産管理に詳しいコンサルタントです。\n"
+            f"基準日は{pd.Timestamp(today):%Y-%m-%d}です。以下はルールで抽出した要注意案件（重要度順）です。\n"
+            f"工場長向けに『今週手を打つべき案件と理由』のレポートを日本語のMarkdownで作成してください。\n"
+            f"構成：1) 全体所見（3行以内） 2) 今週対応すべき案件トップ5（各案件に理由と具体的な推奨アクション："
+            f"外注先へ確認、工程の前倒し、顧客へ事前連絡など） 3) 今週の進め方。データにない事実は創作しないこと。\n\n"
+            f"全案件数：{len(o)}件\n要注意案件：\n{json.dumps(items, ensure_ascii=False, indent=1)}")
 
 
-def resolve_llm_from_env() -> tuple[str, str, str] | None:
-    """環境変数だけを見る。キーが無ければ None。秘密はファイルに書かない。"""
-    model_override = os.environ.get("LLM_MODEL") or None
-    xai_key = os.environ.get("XAI_API_KEY")
-    if xai_key:
-        return xai_key, "https://api.x.ai/v1/chat/completions", model_override or "grok-4"
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if openai_key:
-        return openai_key, "https://api.openai.com/v1/chat/completions", model_override or "gpt-4o-mini"
+def llm_provider():
+    if os.environ.get("XAI_API_KEY"):
+        return ("xAI", "https://api.x.ai/v1/chat/completions", os.environ["XAI_API_KEY"],
+                os.environ.get("LLM_MODEL", "grok-4"))
+    if os.environ.get("OPENAI_API_KEY"):
+        return ("OpenAI", "https://api.openai.com/v1/chat/completions", os.environ["OPENAI_API_KEY"],
+                os.environ.get("LLM_MODEL", "gpt-4o-mini"))
     return None
 
 
-def sample_csv_path() -> Path:
-    return Path(__file__).resolve().parent / "sample_orders.csv"
-
-
-def _read_bytes(source) -> bytes:
-    if isinstance(source, (bytes, bytearray)):
-        return bytes(source)
-    if isinstance(source, Path):
-        return source.read_bytes()
-    if isinstance(source, str):
-        return Path(source).read_bytes()
-    if hasattr(source, "getvalue"):
-        data = source.getvalue()
-        return data if isinstance(data, bytes) else str(data).encode("utf-8")
-    if hasattr(source, "read"):
-        data = source.read()
-        if isinstance(data, str):
-            return data.encode("utf-8")
-        return data
-    raise TypeError(f"読み込めない入力です: {type(source)!r}")
-
-
-def _as_date(value) -> date | None:
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except TypeError:
-        pass
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, pd.Timestamp):
-        if pd.isna(value):
-            return None
-        return value.date()
-    parsed = pd.to_datetime(value, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    return parsed.date()
-
-
-def _md(value: date | None) -> str:
-    if value is None:
-        return "-"
-    return f"{value.month}/{value.day}"
-
-
-def _jp_date(value: date) -> str:
-    return f"{value.year}年{value.month}月{value.day}日"
-
-
-def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
-    return any(keyword in text for keyword in keywords)
-
+def llm_report(prompt: str, timeout: int = 90) -> str:
+    import requests
+    prov = llm_provider()
+    if not prov:
+        raise RuntimeError("APIキーが設定されていません")
+    _, url, key, model = prov
+    resp = requests.post(url, headers={"Authorization": f"Bearer {key}"}, timeout=timeout, json={
+        "model": model, "temperature": 0.3,
+        "messages": [{"role": "system", "content": "あなたは製造業の生産管理コンサルタントです。簡潔で実務的な日本語で書きます。"},
+                     {"role": "user", "content": prompt}]})
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
