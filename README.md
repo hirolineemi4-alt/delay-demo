@@ -54,6 +54,11 @@ streamlit run app.py --server.headless true --server.port 8501
 納期まで7日以内（変更可）で問題あり +40、納期超過 +30。
 **納期7日以内かつ問題あり → 「高」**、スコア80以上 → 「高」、25以上 → 「中」、それ以外 → 「低」。
 
+## Bデモ：在庫の見える化（/inventory）
+在庫表（Excel/CSV）をそのまま読み込むだけで、欠品しそうな品と在庫が多すぎる品を一覧にします（マスタ登録不要）。
+URL：`/inventory`（ルートの納期遅れデモからはリンクしていません）。サンプル：`sample_inventory.xlsx`（架空48品目、`python generate_inventory_sample.py` で再生成）。詳細は DESIGN.md §12。
+
 ## ファイル
-- `app.py` 画面（Streamlit） / `logic.py` 検知ロジック / `generate_sample.py` サンプル生成
-- `test_logic.py`, `test_app.py` 動作確認用テスト
+- `app.py` ルーター（`/` → `delay_demo.py`、`/inventory` → `inventory_demo.py`） / `delay_demo.py` 画面（Streamlit） / `logic.py` 検知ロジック / `generate_sample.py` サンプル生成
+- `inventory_demo.py` / `inventory_logic.py` / `generate_inventory_sample.py` 在庫の見える化デモ
+- `test_logic.py`, `test_app.py`, `test_inventory.py` 動作確認用テスト
