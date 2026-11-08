@@ -11,6 +11,22 @@ REQUIRED_COLUMNS = ["order_id", "customer", "product", "qty", "due_date", "proce
 DATE_COLUMNS = ["due_date", "planned_start", "planned_end", "actual_start", "actual_end", "last_updated"]
 HOLD_KEYWORDS = ["待ち", "不足", "確認中"]
 FLAG_ORDER = ["遅延", "着手遅れ", "停滞", "納期リスク", "保留"]
+# 遅れが確定する前に朝見ておく前兆。APIキーなしのルールで判定する。
+SLIP_DAYS = 2  # 計画と実績のズレは「2日を超える」
+PRECURSOR_ORDER = [
+    "未着手の超過",
+    "状態がN日変わらない停滞",
+    "計画と実績のズレ2日超",
+    "完了見込みが納期超過",
+    "材料入荷が着手予定より後",
+]
+PROCESS_PRECURSORS = [
+    "未着手の超過",
+    "状態がN日変わらない停滞",
+    "計画と実績のズレ2日超",
+    "材料入荷が着手予定より後",
+]
+OPTIONAL_COLUMNS = ["material_arrival"]
 
 
 @dataclass
@@ -35,9 +51,13 @@ def read_csv(src) -> pd.DataFrame:
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"必須列が不足しています: {', '.join(missing)}")
-    df = df[REQUIRED_COLUMNS].copy()
-    for c in DATE_COLUMNS:
-        df[c] = pd.to_datetime(df[c].str.strip().replace("", None), errors="coerce")
+    for c in OPTIONAL_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[REQUIRED_COLUMNS + OPTIONAL_COLUMNS].copy()
+    for c in DATE_COLUMNS + OPTIONAL_COLUMNS:
+        df[c] = pd.to_datetime(df[c].astype(str).str.strip().replace({"": None, "nan": None, "NaT": None}),
+                               errors="coerce")
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
     df["process_seq"] = pd.to_numeric(df["process_seq"], errors="coerce")
     for c in ["status", "note", "process_name", "order_id", "customer", "product"]:
@@ -46,7 +66,19 @@ def read_csv(src) -> pd.DataFrame:
 
 
 def _fmt(dt) -> str:
-    return "-" if pd.isna(dt) else f"{dt.month}/{dt.day}"
+    return "-" if pd.isna(dt) else f"{pd.Timestamp(dt).month}/{pd.Timestamp(dt).day}"
+
+
+def plan_actual_slip_days(p: pd.DataFrame, today) -> pd.Series:
+    """計画と実績のズレ（日）。早まりは0。未完了で予定完了を過ぎている分も含む。"""
+    today = pd.Timestamp(today).normalize()
+    start_slip = (p["actual_start"] - p["planned_start"]).dt.days
+    end_slip = (p["actual_end"] - p["planned_end"]).dt.days
+    overrun = (today - p["planned_end"]).dt.days
+    still_open = (p["status"] != "完了") & p["actual_start"].notna() & p["planned_end"].notna() & (today > p["planned_end"])
+    open_overrun = overrun.where(still_open)
+    slip = pd.concat([start_slip, end_slip, open_overrun], axis=1).max(axis=1, skipna=True)
+    return slip.fillna(0).clip(lower=0).astype(int)
 
 
 def detect_processes(df: pd.DataFrame, today, th: Thresholds) -> pd.DataFrame:
@@ -62,8 +94,21 @@ def detect_processes(df: pd.DataFrame, today, th: Thresholds) -> pd.DataFrame:
     note_hit = p["note"].apply(lambda s: any(k in s for k in HOLD_KEYWORDS))
     p["f_保留"] = (p["status"] == "保留") | (not_done & note_hit)
     p["planned_days"] = (p["planned_end"] - p["planned_start"]).dt.days + 1
+    if "material_arrival" not in p.columns:
+        p["material_arrival"] = pd.NaT
+    p["slip_days"] = plan_actual_slip_days(p, today)
+    # 前兆は既存の5ルールとは別に持つ。未着手の「状態が動かない」は着手予定前なら正常なので、
+    # 停滞の前兆は着手中・保留だけを見る（着手予定を過ぎた未着手は「未着手の超過」）。
+    p["f_未着手の超過"] = (p["status"] == "未着手") & p["planned_start"].notna() & (today > p["planned_start"])
+    p["f_状態がN日変わらない停滞"] = p["status"].isin(["着手中", "保留"]) & (p["days_since_update"] >= th.stall_days)
+    p["f_計画と実績のズレ2日超"] = p["slip_days"] > SLIP_DAYS
+    p["f_材料入荷が着手予定より後"] = (
+        p["material_arrival"].notna() & p["planned_start"].notna()
+        & (p["material_arrival"] > p["planned_start"]) & (p["status"] != "完了")
+    )
 
     reasons = []
+    precursor_reasons = []
     for _, r in p.iterrows():
         rs = []
         if r["f_遅延"]:
@@ -75,7 +120,24 @@ def detect_processes(df: pd.DataFrame, today, th: Thresholds) -> pd.DataFrame:
         if r["f_保留"]:
             rs.append(f"保留：{r.process_name}（{r.note or '状態=保留'}）")
         reasons.append(rs)
+        prs = []
+        if r["f_未着手の超過"]:
+            prs.append(f"未着手の超過：{r.process_name}（予定開始{_fmt(r.planned_start)}を過ぎても未着手）")
+        if r["f_状態がN日変わらない停滞"]:
+            prs.append(
+                f"状態がN日変わらない停滞：{r.process_name}"
+                f"（{r.status}のまま{int(r.days_since_update)}日更新なし、しきい値{th.stall_days}日）"
+            )
+        if r["f_計画と実績のズレ2日超"]:
+            prs.append(f"計画と実績のズレ2日超：{r.process_name}（ずれ{int(r.slip_days)}日）")
+        if r["f_材料入荷が着手予定より後"]:
+            prs.append(
+                f"材料入荷が着手予定より後：{r.process_name}"
+                f"（入荷{_fmt(r.material_arrival)} ＞ 着手予定{_fmt(r.planned_start)}）"
+            )
+        precursor_reasons.append(prs)
     p["reasons"] = reasons
+    p["precursor_reasons"] = precursor_reasons
     return p
 
 
@@ -98,6 +160,31 @@ def summarize_orders(p: pd.DataFrame, today, th: Thresholds) -> pd.DataFrame:
         reasons = [x for lst in g["reasons"] for x in lst]
         if risk:
             reasons.append(f"納期リスク：残工程の予定日数{int(remaining)}日 ＞ 納期まで{days_to_due}日（{shortage}日不足）")
+
+        pre_flags = {f: bool(g[f"f_{f}"].any()) for f in PROCESS_PRECURSORS}
+        pre_reasons = [x for lst in g["precursor_reasons"] for x in lst]
+        # 完了見込み = 基準日 + 残工程の予定日数 + まだ着いていない材料を待つ日数。
+        # 残工程の数え方は既存の納期リスクと同じ（未完了工程の予定日数の合計）。
+        material_wait = 0
+        if not all_done:
+            for _, row in g[g["status"] != "完了"].iterrows():
+                mat = row["material_arrival"]
+                if pd.notna(mat) and mat > today and row["status"] != "着手中":
+                    material_wait = max(material_wait, int((mat - today).days))
+        if all_done or pd.isna(due) or days_to_due is None:
+            forecast = g["actual_end"].max() if all_done else pd.NaT
+            impact = 0
+            pre_flags["完了見込みが納期超過"] = False
+        else:
+            forecast = today + pd.Timedelta(days=int(remaining) + material_wait)
+            impact = max(0, int((forecast - due).days))
+            pre_flags["完了見込みが納期超過"] = bool(forecast > due)
+            if pre_flags["完了見込みが納期超過"]:
+                wait_txt = f"、うち材料待ち{material_wait}日" if material_wait else ""
+                pre_reasons.append(
+                    f"完了見込みが納期超過：完了見込み{_fmt(forecast)} ＞ 納期{_fmt(due)}"
+                    f"（納期への影響{impact}日{wait_txt}）"
+                )
 
         # --- スコア ---
         score = 0
@@ -136,7 +223,11 @@ def summarize_orders(p: pd.DataFrame, today, th: Thresholds) -> pd.DataFrame:
             progress=f"{int((g['status'] == '完了').sum())}/{len(g)}",
             remaining_days=int(remaining), score=int(score), rank=rank,
             issues="・".join(f for f in FLAG_ORDER if flags[f]) or "問題なし",
-            reasons=" ／ ".join(reasons), hold_notes=notes, **{f"f_{k}": v for k, v in flags.items()},
+            reasons=" ／ ".join(reasons), hold_notes=notes,
+            impact_days=int(impact), forecast_date=forecast, material_wait=int(material_wait),
+            precursors="・".join(f for f in PRECURSOR_ORDER if pre_flags[f]) or "なし",
+            precursor_reasons=" ／ ".join(pre_reasons),
+            **{f"f_{k}": v for k, v in {**flags, **pre_flags}.items()},
         ))
     o = pd.DataFrame(out)
     rank_order = {"高": 0, "中": 1, "低": 2}
@@ -151,6 +242,13 @@ def analyze(df: pd.DataFrame, today, th: Thresholds):
     return p, o
 
 
+def morning_three(o: pd.DataFrame, n: int = 3) -> pd.DataFrame:
+    """重要度順を保ったまま、前兆がある案件から今朝見る上位n件を返す。"""
+    if o.empty or "precursors" not in o.columns:
+        return o.head(0)
+    return o[o["precursors"] != "なし"].head(n).reset_index(drop=True)
+
+
 # ---------------- レポート ----------------
 def recommend_actions(row: pd.Series, th: Thresholds) -> list[str]:
     acts = []
@@ -163,11 +261,15 @@ def recommend_actions(row: pd.Series, th: Thresholds) -> list[str]:
         acts.append("顧客へ回答期限を区切って図面確認を依頼（回答待ちで工程が止まっている旨を共有）")
     if "人員" in notes or "不足" in notes:
         acts.append("他班からの応援・残業／休日出勤で人員を補填")
-    if row["f_停滞"]:
+    if row["f_停滞"] or row.get("f_状態がN日変わらない停滞"):
         acts.append("担当者に現状をヒアリングし、止まっている原因（設備・治具・段取り）を当日中に特定")
-    if row["f_遅延"] or row["f_着手遅れ"]:
+    if row["f_遅延"] or row["f_着手遅れ"] or row.get("f_未着手の超過"):
         acts.append("後工程の段取りを前倒しし、設備の空き枠に割り込みを検討")
-    if row["f_納期リスク"]:
+    if row.get("f_計画と実績のズレ2日超"):
+        acts.append("計画を実績に合わせて引き直し、後工程の開始日を見直す")
+    if row.get("f_材料入荷が着手予定より後") and "材料" not in notes:
+        acts.append("材料の入荷が着手予定に間に合うか仕入先へ確認し、間に合わなければ代替材を検討")
+    if row["f_納期リスク"] or row.get("f_完了見込みが納期超過"):
         acts.append("工程の並行化・外注活用で短縮できるか検討")
         if row["days_to_due"] is not None and row["days_to_due"] <= th.due_window:
             acts.append("顧客へ事前連絡し、分納や納期調整の可能性を早めに相談")
@@ -182,7 +284,26 @@ def rule_based_report(o: pd.DataFrame, today, th: Thresholds, top_n: int = 5) ->
     top = flagged.head(top_n)
     n_high = int((o["rank"] == "高").sum())
     lines = [f"## 今週手を打つべき案件レポート（基準日：{today:%Y年%m月%d日}）", "",
-             "### 全体所見",
+             "いまの工程表（スプレッドシート）の代わりではなく、遅れの前兆を見えるように足したものです。",
+             "候補はルールからの提案です。手を打つ前に、人が内容を確認してください。", ""]
+    top3 = morning_three(o, 3)
+    lines += ["### 今朝見る3件（提案 → 人が確認）", ""]
+    if top3.empty:
+        lines.append("- 前兆ルールに該当する案件はありません。")
+        lines.append("")
+    else:
+        lines.append("- 画面上の「確認した」は、人がこの提案を見た、という印です。")
+        for i, (_, r) in enumerate(top3.iterrows(), 1):
+            lines.append(
+                f"**{i}. {r.order_id}｜{r.customer}｜{r['product']}**"
+                f" — 納期への影響 **+{int(r.impact_days)}日**"
+            )
+            lines.append(f"- 完了見込み：{_fmt(r.forecast_date)}　納期：{_fmt(r.due_date)}　前兆：{r.precursors}")
+            for rs in str(r.precursor_reasons).split(" ／ "):
+                if rs and rs != "nan":
+                    lines.append(f"  - {rs}")
+        lines.append("")
+    lines += ["### 全体所見",
              f"- 全{len(o)}案件のうち、要注意案件は **{len(flagged)}件**、うち高リスクは **{n_high}件** です。"]
     cnt = {f: int(o[f"f_{f}"].sum()) for f in FLAG_ORDER}
     lines.append("- 内訳：" + "、".join(f"{k} {v}件" for k, v in cnt.items()) + "（重複あり）")
@@ -192,7 +313,8 @@ def rule_based_report(o: pd.DataFrame, today, th: Thresholds, top_n: int = 5) ->
     for i, (_, r) in enumerate(top.iterrows(), 1):
         due_txt = f"{r.due_date:%m/%d}（残り{r.days_to_due}日）" if r.days_to_due >= 0 else f"{r.due_date:%m/%d}（{-r.days_to_due}日超過）"
         lines.append(f"**{i}. {r.order_id}｜{r.customer}｜{r["product"]} {int(r.qty)}個** — 重要度 **{r['rank']}**（スコア{r.score}）")
-        lines.append(f"- 納期：{due_txt}　現在工程：{r.current_process}")
+        impact_txt = f"+{int(r.impact_days)}日" if "impact_days" in r.index else "-"
+        lines.append(f"- 納期：{due_txt}　現在工程：{r.current_process}　納期への影響：{impact_txt}")
         lines.append("- 理由：")
         for rs in r.reasons.split(" ／ "):
             lines.append(f"  - {rs}")
@@ -213,7 +335,10 @@ def build_llm_prompt(o: pd.DataFrame, today, top_n: int = 8) -> str:
     flagged = o[o["issues"] != "問題なし"].head(top_n)
     items = [dict(案件=r.order_id, 顧客=r.customer, 品名=r["product"], 数量=int(r.qty),
                   納期=f"{r.due_date:%Y-%m-%d}", 納期まで日数=r.days_to_due, 重要度=r["rank"],
-                  スコア=r.score, 現在工程=r.current_process, フラグ=r.issues, 理由=r.reasons)
+                  スコア=r.score, 現在工程=r.current_process, フラグ=r.issues, 理由=r.reasons,
+                  前兆=r.precursors, 前兆の理由=r.precursor_reasons,
+                  納期への影響日数=int(r.impact_days),
+                  完了見込み=("" if pd.isna(r.forecast_date) else f"{r.forecast_date:%Y-%m-%d}"))
              for _, r in flagged.iterrows()]
     return (f"あなたは日本の中小製造業（町工場）の生産管理に詳しいコンサルタントです。\n"
             f"基準日は{pd.Timestamp(today):%Y-%m-%d}です。以下はルールで抽出した要注意案件（重要度順）です。\n"

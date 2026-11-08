@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from logic import (Thresholds, read_csv, analyze, rule_based_report, build_llm_prompt,
-                   llm_provider, llm_report, FLAG_ORDER)
+                   llm_provider, llm_report, FLAG_ORDER, PRECURSOR_ORDER, morning_three)
 
 APP_DIR = Path(__file__).parent
 SAMPLE = APP_DIR / "sample_orders.csv"
@@ -33,14 +33,19 @@ with st.sidebar:
     with st.expander("重要度スコアの境界"):
         high_score = st.number_input("「高」スコア ≥", 10, 500, 80)
         mid_score = st.number_input("「中」スコア ≥", 1, 500, 25)
-    st.caption("ルール：遅延／着手遅れ／停滞／納期リスク／保留\n\n"
-               f"納期{due_window}日以内かつ何らかの問題がある案件は自動的に「高」になります。")
+    st.caption("既存ルール：遅延／着手遅れ／停滞／納期リスク／保留\n\n"
+               "前兆ルール：未着手の超過／状態がN日変わらない停滞／計画と実績のズレ2日超／"
+               "完了見込みが納期超過／材料入荷が着手予定より後\n\n"
+               f"納期{due_window}日以内かつ何らかの問題がある案件は自動的に「高」になります。"
+               "前兆の「N日」は上の停滞日数と同じです。計画と実績のズレは2日を超えた工程が対象です。")
 
 th = Thresholds(stall_days=int(stall_days), due_window=int(due_window),
                 high_score=int(high_score), mid_score=int(mid_score))
 
 st.title("🏭 納期遅れ・停滞の早期検知デモ")
-st.caption("CSV読み込み → ルールで遅れ・停滞を抽出 → 重要度順に一覧 → 「今週手を打つべき案件」をレポート化")
+st.caption("いま使っている工程表（スプレッドシート）の代わりにはなりません。"
+           "CSVを読み、遅れの前兆を朝のうちに見えるように足すデモです。"
+           "候補はルールが提案し、人が確認します。APIキーは不要です。")
 
 try:
     df = read_csv(up) if up is not None else read_csv(SAMPLE)
@@ -51,6 +56,59 @@ src_name = up.name if up is not None else "sample_orders.csv（架空のサン�
 
 procs, orders = analyze(df, base_date, th)
 flagged = orders[orders["issues"] != "問題なし"]
+st.caption(f"データ：{src_name}　／　基準日：{base_date:%Y-%m-%d}　／　架空のサンプルです")
+
+# ---------------- 今朝見る3件（提案 → 人が確認） ----------------
+st.markdown("### 今朝見る3件")
+st.caption("重要度の高い案件から3件を提案します。内容を読んで「確認した」を押すのは人です。提案だけでは採用しません。")
+
+morning = morning_three(orders)
+confirmed = list(st.session_state.setdefault("confirmed_orders", []))
+if morning.empty:
+    st.info("前兆ルールに該当する案件はありません。")
+else:
+    n_ok = sum(oid in confirmed for oid in morning["order_id"])
+    st.caption(f"提案 {len(morning)}件　／　確認済み {n_ok}件　／　未確認 {len(morning) - n_ok}件")
+    cards = st.columns(len(morning))
+    for col, (_, job) in zip(cards, morning.iterrows()):
+        oid = job.order_id
+        done = oid in confirmed
+        impact = int(job.impact_days)
+        forecast = "-" if pd.isna(job.forecast_date) else f"{job.forecast_date:%m/%d}"
+        due = "-" if pd.isna(job.due_date) else f"{job.due_date:%m/%d}"
+        with col:
+            with st.container(border=True):
+                if done:
+                    st.markdown('<span class="badge" style="background:#dcfce7;color:#166534">確認済み</span>',
+                                unsafe_allow_html=True)
+                else:
+                    st.markdown('<span class="badge" style="background:#dbeafe;color:#1e40af">提案</span>',
+                                unsafe_allow_html=True)
+                st.markdown(f"**{oid}**")
+                st.caption(f"{job.customer}／{job['product']}")
+                st.metric("納期への影響", f"+{impact}日" if impact else "0日")
+                st.caption(f"完了見込み {forecast}　／　納期 {due}")
+                st.markdown("**前兆**")
+                for name in str(job.precursors).split("・"):
+                    if name and name != "なし":
+                        st.markdown(f"- {name}")
+                with st.expander("提案の理由"):
+                    for line in str(job.precursor_reasons).split(" ／ "):
+                        if line and line != "nan":
+                            st.markdown(f"- {line}")
+                if done:
+                    st.caption("人がこの提案を確認しました。")
+                    if st.button("確認を取り消す", key=f"unconfirm_{oid}"):
+                        st.session_state["confirmed_orders"] = [x for x in confirmed if x != oid]
+                        st.rerun()
+                elif st.button("確認した", key=f"confirm_{oid}", type="primary"):
+                    st.session_state["confirmed_orders"] = confirmed + [oid]
+                    st.rerun()
+
+st.caption("前兆ルール（受注単位）")
+rule_cols = st.columns(len(PRECURSOR_ORDER))
+for col, name in zip(rule_cols, PRECURSOR_ORDER):
+    col.metric(name, f"{int(orders[f'f_{name}'].sum())}件")
 
 # ---------------- KPI ----------------
 def kpi(col, label, value, sub, color):
@@ -63,7 +121,6 @@ kpi(c1, "全案件数", len(orders), f"工程行数 {len(df)}", "#111827")
 kpi(c2, "要注意案件数", len(flagged), "いずれかのルールに該当", "#d97706")
 kpi(c3, "高リスク件数", int((orders["rank"] == "高").sum()), f"納期{th.due_window}日以内の問題案件など", "#dc2626")
 kpi(c4, "停滞工程数", int(procs["f_停滞"].sum()), f"{th.stall_days}日以上更新なし（着手中）", "#7c3aed")
-st.caption(f"データ：{src_name}　／　基準日：{base_date:%Y-%m-%d}")
 
 tab1, tab2, tab3 = st.tabs(["📋 要注意案件一覧", "🔍 案件ドリルダウン", "📝 AIレポート"])
 
@@ -75,7 +132,10 @@ def display_table(o: pd.DataFrame) -> pd.DataFrame:
         "重要度": o["rank"].map(RANK_ICON), "スコア": o["score"], "受注No": o["order_id"],
         "顧客": o["customer"], "品名": o["product"], "数量": o["qty"].astype("Int64"),
         "納期": o["due_date"].dt.strftime("%Y-%m-%d"), "納期まで": o["days_to_due"].astype(str) + "日",
-        "進捗": o["progress"], "現在工程": o["current_process"], "該当ルール": o["issues"], "理由": o["reasons"]})
+        "進捗": o["progress"], "現在工程": o["current_process"], "該当ルール": o["issues"],
+        "前兆": o["precursors"],
+        "納期影響": o["impact_days"].map(lambda n: f"+{int(n)}日" if int(n) else "0日"),
+        "理由": o["reasons"]})
     return t
 
 with tab1:
@@ -98,10 +158,14 @@ with tab1:
 
     out = view.copy()
     out["due_date"] = out["due_date"].dt.strftime("%Y-%m-%d")
+    out["forecast_date"] = out["forecast_date"].dt.strftime("%Y-%m-%d")
     out = out.rename(columns={"order_id": "受注No", "customer": "顧客", "product": "品名", "qty": "数量",
                               "due_date": "納期", "days_to_due": "納期まで日数", "current_process": "現在工程",
                               "progress": "進捗", "remaining_days": "残工程予定日数", "score": "スコア",
-                              "rank": "重要度", "issues": "該当ルール", "reasons": "理由", "hold_notes": "保留メモ"})
+                              "rank": "重要度", "issues": "該当ルール", "reasons": "理由", "hold_notes": "保留メモ",
+                              "impact_days": "納期影響日数", "forecast_date": "完了見込み",
+                              "material_wait": "材料待ち日数", "precursors": "前兆",
+                              "precursor_reasons": "前兆の理由"})
     out = out[[c for c in out.columns if not c.startswith("f_")]]
     st.download_button("⬇️ 抽出結果をCSVでダウンロード", out.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"要注意案件_{base_date:%Y%m%d}.csv", mime="text/csv")
@@ -113,15 +177,24 @@ with tab2:
     o = orders[orders["order_id"] == sel].iloc[0]
     g = procs[procs["order_id"] == sel].sort_values("process_seq")
 
-    m1, m2, m3, m4 = st.columns(4)
+    fc = "-" if pd.isna(o["forecast_date"]) else f"{o['forecast_date']:%m/%d}"
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("重要度", RANK_ICON[o["rank"]], f"スコア {o['score']}", delta_color="off")
     m2.metric("納期", f"{o['due_date']:%m/%d}", f"残り{o['days_to_due']}日", delta_color="off")
     m3.metric("進捗", o["progress"], o["current_process"], delta_color="off")
     m4.metric("残工程の予定日数", f"{o['remaining_days']}日")
+    with m5:
+        st.metric("納期への影響", f"+{int(o['impact_days'])}日" if int(o["impact_days"]) else "0日")
+        st.caption(f"完了見込み {fc}")
     if o["issues"] != "問題なし":
         st.warning("**該当ルール：** " + o["issues"] + "\n\n" + "\n".join(f"- {x}" for x in o["reasons"].split(" ／ ")))
     else:
         st.success("問題は検知されていません。")
+    if o["precursors"] != "なし":
+        confirmed_here = o["order_id"] in st.session_state.get("confirmed_orders", [])
+        state = "確認済み" if confirmed_here else "提案（未確認）"
+        st.info("**前兆ルール（" + state + "）：** " + o["precursors"] + "\n\n"
+                + "\n".join(f"- {x}" for x in str(o["precursor_reasons"]).split(" ／ ") if x))
 
     # ガントチャート（予定 vs 実績）
     bars = []
