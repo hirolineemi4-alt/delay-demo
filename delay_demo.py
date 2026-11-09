@@ -1,11 +1,63 @@
 """納期遅れ・停滞の早期検知デモ（Streamlit）"""
 from datetime import date, timedelta
 from pathlib import Path
+import importlib.util
+import os
+import sys
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from logic import (Thresholds, read_csv, analyze, rule_based_report, build_llm_prompt,
-                   llm_provider, llm_report, FLAG_ORDER, PRECURSOR_ORDER, morning_three)
+
+
+def _load_local_logic():
+    """このページと同じディレクトリの logic.py を、ファイルパスから読む。
+
+    Streamlit は再実行しても sys.modules に残った logic を使い続ける。
+    デプロイで delay_demo.py だけ先に読み直されると、古い logic には
+    PRECURSOR_ORDER と morning_three が無く、ImportError になる。
+    在庫ページは古い名前だけを読むので、そのままだと落ちない。
+    """
+    path = str((Path(__file__).resolve().parent / "logic.py"))
+    mod_name = "_delay_demo_logic"
+    mtime = os.path.getmtime(path)
+    cached = sys.modules.get(mod_name)
+    if (
+        cached is not None
+        and getattr(cached, "__file__", None) == path
+        and getattr(cached, "_loaded_mtime", None) == mtime
+        and hasattr(cached, "PRECURSOR_ORDER")
+        and hasattr(cached, "morning_three")
+    ):
+        return cached
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"logic.py が見つかりません: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    missing = [name for name in ("PRECURSOR_ORDER", "morning_three") if not hasattr(mod, name)]
+    if missing:
+        sys.modules.pop(mod_name, None)
+        raise ImportError(f"logic.py に {', '.join(missing)} がありません: {path}")
+    mod._loaded_mtime = mtime
+    return mod
+
+
+_logic = _load_local_logic()
+Thresholds = _logic.Thresholds
+read_csv = _logic.read_csv
+analyze = _logic.analyze
+rule_based_report = _logic.rule_based_report
+build_llm_prompt = _logic.build_llm_prompt
+llm_provider = _logic.llm_provider
+llm_report = _logic.llm_report
+FLAG_ORDER = _logic.FLAG_ORDER
+PRECURSOR_ORDER = _logic.PRECURSOR_ORDER
+morning_three = _logic.morning_three
 
 APP_DIR = Path(__file__).parent
 SAMPLE = APP_DIR / "sample_orders.csv"
