@@ -12,7 +12,8 @@ def d(n):
     return BASE + timedelta(days=n)
 
 COLUMNS = ["order_id", "customer", "product", "qty", "due_date", "process_seq", "process_name",
-           "planned_start", "planned_end", "actual_start", "actual_end", "status", "last_updated", "note"]
+           "planned_start", "planned_end", "actual_start", "actual_end", "status", "last_updated", "note",
+           "material_arrival"]
 
 CUSTOMERS = ["株式会社テスト精工", "サンプル電機株式会社", "デモ産業株式会社", "架空機械工業株式会社",
              "株式会社モック製作所", "ダミー自動車部品株式会社", "株式会社サンプル重工"]
@@ -29,21 +30,24 @@ ROUTES = {
 
 rows = []
 
-def add(oid, cust, prod, qty, due, procs):
-    """procs: (name, ps, pe, status, as, ae, lu, note)  日付はBASEからの日数オフセット or None"""
+def add(oid, cust, prod, qty, due, procs, material_arrival=None):
+    """procs: (name, ps, pe, status, as, ae, lu, note)  日付はBASEからの日数オフセット or None。
+    material_arrival は先頭工程の材料入荷日（BASEからの日数）。着手予定より後なら前兆ルール5。"""
     for i, (name, ps, pe, st, a_s, a_e, lu, note) in enumerate(procs, 1):
         rows.append(dict(order_id=oid, customer=cust, product=prod, qty=qty, due_date=d(due),
                          process_seq=i, process_name=name, planned_start=d(ps), planned_end=d(pe),
                          actual_start=d(a_s) if a_s is not None else None,
                          actual_end=d(a_e) if a_e is not None else None,
-                         status=st, last_updated=d(lu), note=note))
+                         status=st, last_updated=d(lu), note=note,
+                         material_arrival=d(material_arrival) if (material_arrival is not None and i == 1) else None))
 
 # ---------------- 手作りの問題ケース ----------------
 problem = {}
 problem["ORD-1003"] = lambda: add("ORD-1003", "デモ産業株式会社", "架台フレーム", 4, 4, [
     ("切断", -10, -9, "完了", -10, -9, -9, ""),
-    ("曲げ", -8, -7, "完了", -8, -6, -6, "曲げ角度の再調整あり"),
-    ("溶接", -6, -3, "着手中", -5, None, -1, "溶接歪みの修正に時間がかかっている"),
+    # 実績完了 11/06 は予定完了 11/03 より3日遅い → 計画と実績のズレ2日超
+    ("曲げ", -8, -7, "完了", -8, -4, -4, "曲げ角度の再調整あり（実績完了が予定より3日遅れ）"),
+    ("溶接", -6, -3, "着手中", -4, None, -1, "溶接歪みの修正に時間がかかっている"),
     ("表面処理", -2, 0, "未着手", None, None, -6, ""),
     ("検査", 1, 1, "未着手", None, None, -6, "")])
 problem["ORD-1010"] = lambda: add("ORD-1010", "ダミー自動車部品株式会社", "シャフト", 50, 3, [
@@ -68,10 +72,11 @@ problem["ORD-1015"] = lambda: add("ORD-1015", "サンプル電機株式会社", 
     ("表面処理", 8, 9, "未着手", None, None, -1, ""),
     ("検査", 10, 10, "未着手", None, None, -1, "")])
 problem["ORD-1005"] = lambda: add("ORD-1005", "架空機械工業株式会社", "ベースプレート", 20, 9, [
+    # 材料入荷 11/12 は切断の着手予定 11/08 より後 → 材料入荷が着手予定より後
     ("切断", -2, -1, "保留", None, None, -3, "材料待ち（SS400 t12 入荷遅れ、11/12入荷予定）"),
     ("機械加工", 0, 3, "未着手", None, None, -3, ""),
     ("検査", 4, 5, "未着手", None, None, -3, ""),
-    ("出荷", 6, 6, "未着手", None, None, -3, "")])
+    ("出荷", 6, 6, "未着手", None, None, -3, "")], material_arrival=2)
 problem["ORD-1019"] = lambda: add("ORD-1019", "サンプル電機株式会社", "フランジ", 100, 5, [
     ("切断", -12, -11, "完了", -12, -11, -11, ""),
     ("機械加工", -10, -6, "完了", -10, -6, -6, ""),
@@ -138,7 +143,8 @@ for oid in ids:
         normal_order(oid)
 
 df = pd.DataFrame(rows, columns=COLUMNS)
-for c in ["due_date", "planned_start", "planned_end", "actual_start", "actual_end", "last_updated"]:
+for c in ["due_date", "planned_start", "planned_end", "actual_start", "actual_end", "last_updated",
+          "material_arrival"]:
     df[c] = pd.to_datetime(df[c]).dt.strftime("%Y-%m-%d")
 df = df.fillna("")
 df.to_csv("sample_orders.csv", index=False, encoding="utf-8-sig")
