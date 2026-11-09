@@ -312,7 +312,7 @@ def rule_based_report(o: pd.DataFrame, today, th: Thresholds, top_n: int = 5) ->
     lines += ["", f"### 今週対応すべき案件トップ{len(top)}", ""]
     for i, (_, r) in enumerate(top.iterrows(), 1):
         due_txt = f"{r.due_date:%m/%d}（残り{r.days_to_due}日）" if r.days_to_due >= 0 else f"{r.due_date:%m/%d}（{-r.days_to_due}日超過）"
-        lines.append(f"**{i}. {r.order_id}｜{r.customer}｜{r["product"]} {int(r.qty)}個** — 重要度 **{r['rank']}**（スコア{r.score}）")
+        lines.append(f"**{i}. {r.order_id}｜{r.customer}｜{r['product']} {int(r.qty)}個** — 重要度 **{r['rank']}**（スコア{r.score}）")
         impact_txt = f"+{int(r.impact_days)}日" if "impact_days" in r.index else "-"
         lines.append(f"- 納期：{due_txt}　現在工程：{r.current_process}　納期への影響：{impact_txt}")
         lines.append("- 理由：")
